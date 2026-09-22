@@ -1,0 +1,5 @@
+aiogram>=3.4.0,<4.0.0
+aiohttp>=3.9.0,<4.0.0
+yt-dlp>=2024.0.0
+static-ffmpeg>=2.5
+python-dotenv>=1.0.0
