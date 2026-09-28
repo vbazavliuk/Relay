@@ -1,8 +1,10 @@
 services:
   relay:
-    build: .
+    build:
+      context: .
+      dockerfile: Dockerfile
     container_name: relay-bot
-    restart: always
+    restart: unless-stopped
     env_file:
       - .env
     logging:

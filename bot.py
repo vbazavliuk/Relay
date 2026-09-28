@@ -45,9 +45,9 @@ bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
 
 # Regular expressions for media links
-TIKTOK_REGEX = re.compile(r"https?://(?:www\.|vm\.|vt\.)?tiktok\.com/[^\s]+")
+TIKTOK_REGEX = re.compile(r"https?://(?:www\.|vm\.|vt\.|m\.)?tiktok\.com/[^\s]+")
 INSTA_REGEX = re.compile(
-    r"https?://(?:www\.)?instagram\.com/(?:reel|p|tv)/[A-Za-z0-9_-]+[^\s]*"
+    r"https?://(?:www\.|m\.)?instagram\.com/(?:reels?|p|tv|share/reel|share)/([A-Za-z0-9_-]+)[^\s]*"
 )
 TWITTER_REGEX = re.compile(
     r"https?://(?:(?:www|mobile)\.)?(?:twitter\.com|x\.com|fxtwitter\.com|vxtwitter\.com|fixupx\.com)/[^\s/]+/status(?:es)?/(\d+)[^\s]*"
@@ -58,6 +58,45 @@ YOUTUBE_REGEX = re.compile(
 FACEBOOK_REGEX = re.compile(
     r"https?://(?:(?:www|m|web)\.)?(?:facebook\.com/(?:reel/|reels/|share/(?:[rv]/)?|watch/?\?(?:[^#\s]*&)?v=|[^\s/]+/videos/)|fb\.watch/)[^\s]+"
 )
+
+MEDIA_PATTERNS = [
+    ("tiktok", TIKTOK_REGEX),
+    ("instagram", INSTA_REGEX),
+    ("twitter", TWITTER_REGEX),
+    ("youtube", YOUTUBE_REGEX),
+    ("facebook", FACEBOOK_REGEX),
+]
+
+
+def extract_media_links(text: str) -> list[tuple[str, str, str | None]]:
+    """
+    Extracts all supported media links from text in the order they appear.
+    Strips trailing punctuation and avoids duplicate or overlapping URLs.
+    Returns a list of tuples: (platform, clean_url, extra_id)
+    """
+    matches = []
+    for platform, pattern in MEDIA_PATTERNS:
+        for m in pattern.finditer(text):
+            raw_url = m.group(0)
+            clean_url = raw_url.rstrip(".,;:!?)]>'\"")
+            extra = m.group(1) if m.re.groups >= 1 else None
+            matches.append((m.start(), m.end(), platform, clean_url, extra))
+
+    matches.sort(key=lambda x: x[0])
+
+    filtered = []
+    seen_urls = set()
+    last_end = -1
+    for start, end, platform, url, extra in matches:
+        if start < last_end:
+            continue
+        if url in seen_urls:
+            continue
+        seen_urls.add(url)
+        filtered.append((platform, url, extra))
+        last_end = end
+
+    return filtered
 
 
 # Global shared HTTP session for connection pooling
@@ -295,7 +334,10 @@ async def reply_with_video_file(
     if file_size > 50 * 1024 * 1024:
         logger.warning("Файл перевищує ліміт Telegram (50 MB): %d байт", file_size)
         try:
-            await message.reply("⚠️ Розмір відео перевищує 50 МБ (ліміт Telegram для ботів).")
+            await message.reply(
+                "⚠️ Розмір відео перевищує 50 МБ (ліміт Telegram для ботів).",
+                allow_sending_without_reply=True,
+            )
         except TelegramAPIError:
             pass
         return False
@@ -323,6 +365,7 @@ async def reply_with_video_file(
             duration=duration,
             thumbnail=thumb_input,
             supports_streaming=True,
+            allow_sending_without_reply=True,
         )
 
         if sent_msg and sent_msg.video:
@@ -347,6 +390,23 @@ async def reply_with_video_file(
                 pass
 
     return False
+
+
+async def send_cached_video(message: Message, cached: CachedVideo) -> bool:
+    """Helper to send a cached video by file_id with original dimensions."""
+    try:
+        await message.reply_video(
+            video=cached.file_id,
+            width=cached.width,
+            height=cached.height,
+            duration=cached.duration,
+            supports_streaming=True,
+            allow_sending_without_reply=True,
+        )
+        return True
+    except TelegramAPIError as e:
+        logger.debug("Помилка відправки кешованого відео в Telegram: %s", e)
+        return False
 
 
 # --- TikTok Downloader (TikWM API with fallback to yt-dlp) ---
@@ -377,21 +437,11 @@ async def extract_tiktok_url(url: str) -> str | None:
     return None
 
 
-async def process_and_send_tiktok(message: Message, url: str):
+async def process_and_send_tiktok(message: Message, url: str) -> bool:
     # Cache lookup
     cached = await file_cache.get(url)
-    if cached:
-        try:
-            await message.reply_video(
-                video=cached.file_id,
-                width=cached.width,
-                height=cached.height,
-                duration=cached.duration,
-                supports_streaming=True,
-            )
-            return
-        except TelegramAPIError:
-            pass
+    if cached and await send_cached_video(message, cached):
+        return True
 
     async with chat_action_sender(bot, message.chat.id):
         temp_dir = tempfile.mkdtemp()
@@ -421,7 +471,7 @@ async def process_and_send_tiktok(message: Message, url: str):
                 )
             if ytdlp_file:
                 try:
-                    await reply_with_video_file(message, url, ytdlp_file)
+                    success = await reply_with_video_file(message, url, ytdlp_file)
                 finally:
                     try:
                         if os.path.exists(ytdlp_file):
@@ -440,6 +490,8 @@ async def process_and_send_tiktok(message: Message, url: str):
                 os.rmdir(temp_dir)
         except OSError:
             pass
+
+        return success
 
 
 # --- Universal yt-dlp Downloader with Guaranteed Audio & Aspect Ratio ---
@@ -525,31 +577,21 @@ def download_instagram_sync(url: str) -> str | None:
     )
 
 
-async def process_and_send_instagram(message: Message, url: str):
+async def process_and_send_instagram(message: Message, url: str) -> bool:
     # Cache lookup
     cached = await file_cache.get(url)
-    if cached:
-        try:
-            await message.reply_video(
-                video=cached.file_id,
-                width=cached.width,
-                height=cached.height,
-                duration=cached.duration,
-                supports_streaming=True,
-            )
-            return
-        except TelegramAPIError:
-            pass
+    if cached and await send_cached_video(message, cached):
+        return True
 
     async with chat_action_sender(bot, message.chat.id):
         async with download_semaphore:
             file_path = await asyncio.to_thread(download_instagram_sync, url)
 
         if not file_path:
-            return
+            return False
 
         try:
-            await reply_with_video_file(message, url, file_path)
+            return await reply_with_video_file(message, url, file_path)
         finally:
             try:
                 if os.path.exists(file_path):
@@ -606,25 +648,15 @@ async def extract_twitter_url(tweet_id: str) -> str | None:
     return None
 
 
-async def process_and_send_twitter(message: Message, url: str, tweet_id: str):
+async def process_and_send_twitter(message: Message, url: str, tweet_id: str) -> bool:
     # Cache lookup
     cached = await file_cache.get(url)
-    if cached:
-        try:
-            await message.reply_video(
-                video=cached.file_id,
-                width=cached.width,
-                height=cached.height,
-                duration=cached.duration,
-                supports_streaming=True,
-            )
-            return
-        except TelegramAPIError:
-            pass
+    if cached and await send_cached_video(message, cached):
+        return True
 
     async with chat_action_sender(bot, message.chat.id):
         # 1. Fast path via FxTwitter API
-        direct_url = await extract_twitter_url(tweet_id)
+        direct_url = await extract_twitter_url(tweet_id) if tweet_id else None
         temp_dir = tempfile.mkdtemp()
         file_path = os.path.join(temp_dir, "twitter.mp4")
         success = False
@@ -649,7 +681,7 @@ async def process_and_send_twitter(message: Message, url: str, tweet_id: str):
 
             if ytdlp_file:
                 try:
-                    await reply_with_video_file(message, url, ytdlp_file)
+                    success = await reply_with_video_file(message, url, ytdlp_file)
                 finally:
                     try:
                         if os.path.exists(ytdlp_file):
@@ -669,37 +701,29 @@ async def process_and_send_twitter(message: Message, url: str, tweet_id: str):
         except OSError:
             pass
 
+        return success
+
 
 # --- YouTube Downloader (Shorts / Reels / Clips) ---
 def download_youtube_sync(url: str) -> str | None:
     return download_ytdlp_sync(url, platform_name="YouTube")
 
 
-async def process_and_send_youtube(message: Message, url: str):
+async def process_and_send_youtube(message: Message, url: str) -> bool:
     # Cache lookup
     cached = await file_cache.get(url)
-    if cached:
-        try:
-            await message.reply_video(
-                video=cached.file_id,
-                width=cached.width,
-                height=cached.height,
-                duration=cached.duration,
-                supports_streaming=True,
-            )
-            return
-        except TelegramAPIError:
-            pass
+    if cached and await send_cached_video(message, cached):
+        return True
 
     async with chat_action_sender(bot, message.chat.id):
         async with download_semaphore:
             file_path = await asyncio.to_thread(download_youtube_sync, url)
 
         if not file_path:
-            return
+            return False
 
         try:
-            await reply_with_video_file(message, url, file_path)
+            return await reply_with_video_file(message, url, file_path)
         finally:
             try:
                 if os.path.exists(file_path):
@@ -749,7 +773,7 @@ async def resolve_facebook_url(url: str) -> str:
     return url
 
 
-async def process_and_send_facebook(message: Message, url: str):
+async def process_and_send_facebook(message: Message, url: str) -> bool:
     # 1. Cache lookup with raw URL
     cached = await file_cache.get(url)
     resolved_url = url
@@ -758,18 +782,8 @@ async def process_and_send_facebook(message: Message, url: str):
         if resolved_url != url:
             cached = await file_cache.get(resolved_url)
 
-    if cached:
-        try:
-            await message.reply_video(
-                video=cached.file_id,
-                width=cached.width,
-                height=cached.height,
-                duration=cached.duration,
-                supports_streaming=True,
-            )
-            return
-        except TelegramAPIError:
-            pass
+    if cached and await send_cached_video(message, cached):
+        return True
 
     async with chat_action_sender(bot, message.chat.id):
         async with download_semaphore:
@@ -780,7 +794,7 @@ async def process_and_send_facebook(message: Message, url: str):
                 file_path = await asyncio.to_thread(download_facebook_sync, url)
 
         if not file_path:
-            return
+            return False
 
         try:
             success = await reply_with_video_file(message, url, file_path)
@@ -788,6 +802,7 @@ async def process_and_send_facebook(message: Message, url: str):
                 cached_obj = await file_cache.get(url)
                 if cached_obj:
                     await file_cache.set(resolved_url, cached_obj)
+            return success
         finally:
             try:
                 if os.path.exists(file_path):
@@ -797,6 +812,30 @@ async def process_and_send_facebook(message: Message, url: str):
                     os.rmdir(parent_dir)
             except OSError as e:
                 logger.error("Помилка видалення тимчасового файлу Facebook: %s", e)
+
+
+# --- Media Dispatcher ---
+async def process_media_item(
+    message: Message,
+    platform: str,
+    url: str,
+    extra: str | None = None,
+) -> bool:
+    """Dispatches a single media item to its platform-specific downloader."""
+    try:
+        if platform == "tiktok":
+            return await process_and_send_tiktok(message, url)
+        elif platform == "instagram":
+            return await process_and_send_instagram(message, url)
+        elif platform == "twitter":
+            return await process_and_send_twitter(message, url, extra or "")
+        elif platform == "youtube":
+            return await process_and_send_youtube(message, url)
+        elif platform == "facebook":
+            return await process_and_send_facebook(message, url)
+    except Exception as e:
+        logger.error("Несподівана помилка при обробці %s (%s): %s", platform, url, e)
+    return False
 
 
 # --- Command Handlers ---
@@ -824,11 +863,12 @@ async def handle_help(message: Message):
         "📖 <b>Relay Help / Довідка</b>\n\n"
         "<b>How to use / Як користуватись:</b>\n"
         "1. Send any supported link (YouTube, TikTok, Instagram, X/Twitter, Facebook).\n"
-        "2. Relay will process it and send back the clean video directly into the chat.\n\n"
+        "2. Relay will process it and send back the clean video directly into the chat.\n"
+        "3. <b>Multi-link support:</b> Send multiple links at once (even in one message) — Relay downloads all of them!\n\n"
         "<b>Group Chats / Для груп:</b>\n"
-        "To allow Relay to read links automatically without slash commands:\n"
-        "1. Open @BotFather → <code>/mybots</code> → select your bot.\n"
-        "2. <b>Bot Settings</b> → <b>Group Privacy</b> → <b>Turn off</b>.\n\n"
+        "• <b>Privacy:</b> Turn off Group Privacy in @BotFather to let Relay read links automatically.\n"
+        "• <b>Clean chat mode:</b> If Relay has admin rights to delete messages, it will automatically delete the message containing the link, leaving only the clean video in the chat!\n"
+        "• <b>Private chats:</b> In direct 1-on-1 chats, messages are never deleted.\n\n"
         "⚠️ <i>Telegram Bot API limits maximum upload size to 50 MB.</i>"
     )
     await message.reply(help_text, parse_mode="HTML")
@@ -839,7 +879,7 @@ async def handle_ping(message: Message):
     await message.reply("🏓 <b>Pong!</b> Relay is online and ready.", parse_mode="HTML")
 
 
-# --- Fast Message Handler (Fast-path filtering) ---
+# --- Fast Message Handler (Fast-path filtering & Batch Processing) ---
 @dp.message()
 async def handle_message(message: Message):
     text = message.text or message.caption
@@ -868,35 +908,30 @@ async def handle_message(message: Message):
     if not (is_tiktok or is_insta or is_twitter or is_youtube or is_facebook):
         return
 
-    if is_tiktok:
-        match = TIKTOK_REGEX.search(text)
-        if match:
-            await process_and_send_tiktok(message, match.group(0))
-            return
+    media_items = extract_media_links(text)
+    if not media_items:
+        return
 
-    if is_insta:
-        match = INSTA_REGEX.search(text)
-        if match:
-            await process_and_send_instagram(message, match.group(0))
-            return
+    # Cap to avoid overload from a single message (process up to 5 links)
+    media_items = media_items[:5]
 
-    if is_twitter:
-        match = TWITTER_REGEX.search(text)
-        if match:
-            await process_and_send_twitter(message, match.group(0), match.group(1))
-            return
+    # Process all links concurrently
+    tasks = [
+        process_media_item(message, platform, url, extra)
+        for platform, url, extra in media_items
+    ]
+    results = await asyncio.gather(*tasks, return_exceptions=True)
 
-    if is_youtube:
-        match = YOUTUBE_REGEX.search(text)
-        if match:
-            await process_and_send_youtube(message, match.group(0))
-            return
+    any_success = any(res is True for res in results)
 
-    if is_facebook:
-        match = FACEBOOK_REGEX.search(text)
-        if match:
-            await process_and_send_facebook(message, match.group(0))
-            return
+    # In group/supergroup/channel chats where the bot is permitted,
+    # delete the original message with links so only the clean video remains.
+    # In direct 1-on-1 private chats, user messages are never deleted.
+    if message.chat.type != "private" and any_success:
+        try:
+            await message.delete()
+        except TelegramAPIError as e:
+            logger.debug("Не вдалося видалити повідомлення з посиланням: %s", e)
 
 
 

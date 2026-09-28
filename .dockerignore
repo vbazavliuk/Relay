@@ -1,0 +1,33 @@
+# Git
+.git
+.gitignore
+.github
+
+# Python cache & environments
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+env/
+.ruff_cache/
+
+# Local configuration & secrets
+.env
+*.local
+cookies.txt
+
+# OS / Editor artifacts
+.DS_Store
+.idea/
+.vscode/
+
+# Media / temporary test files
+*.mp4
+*.m4a
+*.webm
+*.jpg
+*.png
+!assets/*.png
+*.tmp
