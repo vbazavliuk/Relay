@@ -929,9 +929,27 @@ async def handle_message(message: Message):
     # In direct 1-on-1 private chats, user messages are never deleted.
     if message.chat.type != "private" and any_success:
         try:
+            logger.info(
+                "Спроба видалити повідомлення з посиланням у чаті %s (msg_id=%s)",
+                message.chat.id,
+                message.message_id,
+            )
             await message.delete()
+            logger.info("Повідомлення %s успішно видалено", message.message_id)
         except TelegramAPIError as e:
-            logger.debug("Не вдалося видалити повідомлення з посиланням: %s", e)
+            logger.warning(
+                "Не вдалося видалити повідомлення %s у чаті %s: %s",
+                message.message_id,
+                message.chat.id,
+                e,
+            )
+        except Exception as e:
+            logger.warning(
+                "Несподівана помилка при видаленні повідомлення %s у чаті %s: %s",
+                message.message_id,
+                message.chat.id,
+                e,
+            )
 
 
 
