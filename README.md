@@ -25,6 +25,10 @@
 
 </div>
 
+> [!WARNING]
+> **DO NOT RUN LOCALLY ON MACOS. THIS STACK IS HOSTED ON REMOTE LINUX:**
+> `valentin@192.168.1.110` in `/opt/stacks/Relay/`
+
 <br/>
 
 <a id="-українська"></a>
