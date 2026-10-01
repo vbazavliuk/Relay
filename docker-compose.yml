@@ -1,9 +1,9 @@
 # ==============================================================================
 # DO NOT RUN LOCALLY ON MACOS. THIS STACK IS HOSTED ON REMOTE LINUX:
-# valentin@192.168.1.110 in /opt/stacks/relay/
+# valentin@100.103.31.103 in /opt/stacks/relay/
 #
 # Management commands must be executed on the remote server:
-#   ssh valentin@192.168.1.110 "cd /opt/stacks/relay && docker compose [ps|logs|restart|up -d|down]"
+#   ssh valentin@100.103.31.103 "cd /opt/stacks/relay && docker compose [ps|logs|restart|up -d|down]"
 # ==============================================================================
 
 services:
