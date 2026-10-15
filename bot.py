@@ -1035,7 +1035,7 @@ async def handle_start(message: Message):
     await message.reply(welcome_text, parse_mode="HTML", allow_sending_without_reply=True)
 
 
-@dp.message(Command("help"))
+@dp.message(Command("help", ignore_case=True))
 async def handle_help(message: Message):
     help_text = (
         "📖 <b>Relay Help / Довідка</b>\n\n"
@@ -1047,9 +1047,9 @@ async def handle_help(message: Message):
         "• <b>Privacy:</b> Turn off Group Privacy in @BotFather to let Relay read links automatically.\n"
         "• <b>Clean chat mode:</b> If Relay has admin rights to delete messages, it will automatically delete the message containing the link, leaving only the clean video in the chat!\n"
         "• <b>Admin-only mode (/addon & /addoff):</b> Group admins can restrict Relay to process links exclusively from administrators.\n"
-        "  - <code>/addon</code> — allow video downloads ONLY for group admins\n"
-        "  - <code>/addoff</code> — open video downloads for ALL chat members\n"
-        "  - <code>/addstatus</code> — check current mode in this chat\n"
+        "  - <code>/addon</code> (або <code>/add on</code>) — allow video downloads ONLY for group admins\n"
+        "  - <code>/addoff</code> (або <code>/add off</code>) — open video downloads for ALL chat members\n"
+        "  - <code>/addstatus</code> (або <code>/add status</code>) — check current mode in this chat\n"
         "• <b>Private chats:</b> In direct 1-on-1 chats, messages are never deleted.\n\n"
         "⚠️ <i>Telegram Bot API limits maximum upload size to 50 MB.</i>"
     )
@@ -1061,7 +1061,7 @@ async def handle_help(message: Message):
     await message.reply(help_text, parse_mode="HTML", allow_sending_without_reply=True)
 
 
-@dp.message(Command("ping"))
+@dp.message(Command("ping", ignore_case=True))
 async def handle_ping(message: Message):
     user_id = message.from_user.id if message.from_user else "unknown"
     status_suffix = ""
@@ -1083,7 +1083,7 @@ async def handle_ping(message: Message):
     )
 
 
-@dp.message(Command("addon"))
+@dp.message(Command("addon", "adminon", "add_on", "admin_on", ignore_case=True))
 async def handle_addon(message: Message):
     if message.chat.type == "private":
         await message.reply(
@@ -1096,9 +1096,17 @@ async def handle_addon(message: Message):
 
     sender_chat_id = message.sender_chat.id if message.sender_chat else None
     user_id = message.from_user.id if message.from_user else None
+    user_name = message.from_user.username if message.from_user else "unknown"
 
     is_adm = await is_user_chat_admin(
         message.chat.id, user_id, sender_chat_id, force_refresh=True
+    )
+    logger.info(
+        "Команда /addon у чаті %s від користувача %s (@%s), is_adm=%s",
+        message.chat.id,
+        user_id,
+        user_name,
+        is_adm,
     )
     if not is_adm:
         await message.reply(
@@ -1109,6 +1117,7 @@ async def handle_addon(message: Message):
         return
 
     set_chat_admin_only(message.chat.id, True)
+    logger.info("Успішно увімкнено /addon для чату %s", message.chat.id)
     await message.reply(
         "🔒 <b>Режим «Тільки для адмінів» УВІМКНЕНО для цієї групи (/addon)!</b>\n\n"
         "Тепер бот завантажуватиме медіа <b>лише за посиланнями від адміністраторів</b> цієї групи.\n"
@@ -1119,7 +1128,7 @@ async def handle_addon(message: Message):
     )
 
 
-@dp.message(Command("addoff"))
+@dp.message(Command("addoff", "adminoff", "add_off", "admin_off", ignore_case=True))
 async def handle_addoff(message: Message):
     if message.chat.type == "private":
         await message.reply(
@@ -1131,9 +1140,17 @@ async def handle_addoff(message: Message):
 
     sender_chat_id = message.sender_chat.id if message.sender_chat else None
     user_id = message.from_user.id if message.from_user else None
+    user_name = message.from_user.username if message.from_user else "unknown"
 
     is_adm = await is_user_chat_admin(
         message.chat.id, user_id, sender_chat_id, force_refresh=True
+    )
+    logger.info(
+        "Команда /addoff у чаті %s від користувача %s (@%s), is_adm=%s",
+        message.chat.id,
+        user_id,
+        user_name,
+        is_adm,
     )
     if not is_adm:
         await message.reply(
@@ -1144,6 +1161,7 @@ async def handle_addoff(message: Message):
         return
 
     set_chat_admin_only(message.chat.id, False)
+    logger.info("Успішно вимкнено /addon для чату %s", message.chat.id)
     await message.reply(
         "🔓 <b>Режим «Тільки для адмінів» ВИМКНЕНО для цієї групи (/addoff)!</b>\n\n"
         "Тепер бот завантажує медіа за посиланнями <b>від усіх учасників</b> цієї групи.\n\n"
@@ -1153,7 +1171,7 @@ async def handle_addoff(message: Message):
     )
 
 
-@dp.message(Command("addstatus"))
+@dp.message(Command("addstatus", "adminstatus", "add_status", "admin_status", ignore_case=True))
 async def handle_addstatus(message: Message):
     if message.chat.type == "private":
         await message.reply(
@@ -1178,7 +1196,24 @@ async def handle_addstatus(message: Message):
     )
 
 
-@dp.message(Command("adminonly", "maintenance"))
+@dp.message(Command("add", ignore_case=True))
+async def handle_add_cmd(message: Message, command: CommandObject):
+    arg = (command.args or "").strip().lower()
+    if arg in ("on", "enable", "1", "true"):
+        return await handle_addon(message)
+    elif arg in ("off", "disable", "0", "false"):
+        return await handle_addoff(message)
+    elif arg in ("status", "state"):
+        return await handle_addstatus(message)
+    else:
+        # Toggle current mode
+        if is_chat_admin_only(message.chat.id):
+            return await handle_addoff(message)
+        else:
+            return await handle_addon(message)
+
+
+@dp.message(Command("adminonly", "maintenance", ignore_case=True))
 async def handle_admin_only(message: Message, command: CommandObject):
     user_id = message.from_user.id if message.from_user else None
 
@@ -1318,16 +1353,29 @@ async def handle_message(message: Message):
         return
 
     # Check per-group admin-only mode (/addon)
-    if message.chat.type in ("group", "supergroup") and is_chat_admin_only(message.chat.id):
+    if message.chat.type in ("group", "supergroup"):
+        is_restricted = is_chat_admin_only(message.chat.id)
         sender_chat_id = message.sender_chat.id if message.sender_chat else None
         user_id = message.from_user.id if message.from_user else None
-        if not await is_user_chat_admin(message.chat.id, user_id, sender_chat_id):
-            logger.debug(
-                "Ігноруємо посилання в чаті %s: увімкнено /addon, користувач %s не є адміном",
-                message.chat.id,
-                user_id,
-            )
-            return
+        user_name = message.from_user.username if message.from_user else "unknown"
+
+        if is_restricted:
+            is_adm = await is_user_chat_admin(message.chat.id, user_id, sender_chat_id)
+            if not is_adm:
+                logger.info(
+                    "⛔ [/addon] Ігноруємо посилання в чаті %s від не-адміна %s (@%s)",
+                    message.chat.id,
+                    user_id,
+                    user_name,
+                )
+                return
+            else:
+                logger.info(
+                    "✅ [/addon] Обробляємо посилання в чаті %s від адміна %s (@%s)",
+                    message.chat.id,
+                    user_id,
+                    user_name,
+                )
 
     # Cap to avoid overload from a single message (process up to 5 links)
     media_items = media_items[:5]
