@@ -49,6 +49,7 @@
 * 🔊 **100% гарантія звуку**: зведення роздільних потоків відео (H.264/AVC) та аудіо (AAC) у сумісний контейнер MP4 з прапорцем `+faststart` для моментального перегляду в режимі стримінгу.
 * ⚡ **Блискавичний LRU-кеш**: раніше завантажені відео миттєво відправляються іншим користувачам за мілісекунди через Telegram `file_id` без повторного завантаження з інтернету.
 * 🛡 **Контроль навантаження**: асинхронний семафор (`asyncio.Semaphore`) обмежує кількість важких завантажень, захищаючи процесор і пам'ять VPS від перевантаження.
+* 👑 **Режим «Тільки для адмінів» (Admin-Only Mode)**: можливість вимкнути роботу бота для звичайних користувачів командою `/adminonly` або `/maintenance`. У цьому режимі бот обробляє запити виключно для адміністраторів зі списку `ADMIN_IDS`. У приватних повідомленнях користувачі отримують сповіщення про техобслуговування, а в групах повідомлення не-адмінів ігноруються без спаму.
 
 ---
 
@@ -188,6 +189,7 @@ cp .env.example .env
 | `BOT_TOKEN` | Токен Telegram-бота, отриманий у [@BotFather](https://t.me/BotFather) | *Обов'язково* |
 | `MAX_CONCURRENT_DOWNLOADS` | Ліміт одночасних важких завантажень через `yt-dlp` | `3` |
 | `COOKIES_FILE` | Шлях до файлу cookies для обходу блокувань Instagram / X | `cookies.txt` |
+| `ADMIN_IDS` | Telegram ID адміністраторів через кому (наприклад, `12345678,98765432`) для доступу до `/adminonly` | *Опціонально* |
 
 ---
 
@@ -260,6 +262,7 @@ Specifically engineered to eliminate the infamous **Telegram square/squished vid
 * 🔊 **100% Sound Guarantee**: automatic stream muxing of video (H.264/AVC) and audio (AAC) streams into MP4 containers with `-movflags +faststart` for immediate streaming in Telegram clients.
 * ⚡ **Ultra-Fast LRU Memory Cache**: previously downloaded videos are re-sent to any user within milliseconds using cached Telegram `file_id` references, saving bandwidth and VPS CPU.
 * 🛡 **Concurrency Throttling**: an asynchronous semaphore (`asyncio.Semaphore`) prevents server overloads by strictly capping simultaneous heavy downloads.
+* 👑 **Admin-Only Mode**: toggle bot access for regular users using `/adminonly` or `/maintenance`. When enabled, Relay exclusively services administrators defined by `ADMIN_IDS` in `.env`. In direct chats, regular users receive a polite maintenance alert, while group chat requests from non-admins are dropped silently without spam.
 
 ---
 
@@ -399,6 +402,7 @@ cp .env.example .env
 | `BOT_TOKEN` | Telegram Bot Token obtained from [@BotFather](https://t.me/BotFather) | *Required* |
 | `MAX_CONCURRENT_DOWNLOADS` | Maximum concurrent `yt-dlp` download jobs | `3` |
 | `COOKIES_FILE` | Path to cookies file for bypassing platform limits | `cookies.txt` |
+| `ADMIN_IDS` | Comma-separated administrator Telegram User IDs (e.g., `12345678,98765432`) for `/adminonly` | *Optional* |
 
 ---
 

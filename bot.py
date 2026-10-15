@@ -7,16 +7,18 @@ import shutil
 import subprocess
 import tempfile
 from collections import OrderedDict
+from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from typing import Any
 
 import aiohttp
 import yt_dlp
-from aiogram import Bot, Dispatcher
+from aiogram import BaseMiddleware, Bot, Dispatcher
 from aiogram.enums import ChatAction
 from aiogram.exceptions import TelegramAPIError
-from aiogram.filters import Command, CommandStart
-from aiogram.types import FSInputFile, Message
+from aiogram.filters import Command, CommandObject, CommandStart
+from aiogram.types import FSInputFile, Message, TelegramObject
 from dotenv import load_dotenv
 from yt_dlp.utils import YoutubeDLError
 
@@ -43,6 +45,54 @@ if not BOT_TOKEN:
 
 bot = Bot(token=BOT_TOKEN)
 dp = Dispatcher()
+
+# Administrator configuration and maintenance mode
+ADMIN_IDS_RAW = os.getenv("ADMIN_IDS", "")
+ADMIN_IDS: set[int] = {
+    int(uid.strip())
+    for uid in ADMIN_IDS_RAW.split(",")
+    if uid.strip().lstrip("-").isdigit()
+}
+
+SETTINGS_FILE = os.getenv("SETTINGS_FILE", "settings.json")
+
+
+def load_admin_only_mode() -> bool:
+    """Loads the persisted admin-only mode state from disk if available."""
+    if os.path.exists(SETTINGS_FILE):
+        try:
+            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+                return bool(data.get("admin_only_mode", False))
+        except Exception as e:
+            logger.warning("Не вдалося зчитати %s: %s", SETTINGS_FILE, e)
+    return False
+
+
+def save_admin_only_mode(enabled: bool) -> None:
+    """Persists admin-only mode state to disk."""
+    data = {}
+    if os.path.exists(SETTINGS_FILE):
+        try:
+            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
+                data = json.load(f)
+        except Exception:
+            data = {}
+    data["admin_only_mode"] = enabled
+    try:
+        with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, indent=2)
+    except Exception as e:
+        logger.error("Не вдалося зберегти %s: %s", SETTINGS_FILE, e)
+
+
+admin_only_mode: bool = load_admin_only_mode()
+
+
+def is_admin(user_id: int | None) -> bool:
+    """Returns True if the user ID is in the configured ADMIN_IDS."""
+    return bool(user_id and user_id in ADMIN_IDS)
+
 
 # Regular expressions for media links
 TIKTOK_REGEX = re.compile(r"https?://(?:www\.|vm\.|vt\.|m\.)?tiktok\.com/[^\s]+")
@@ -97,6 +147,56 @@ def extract_media_links(text: str) -> list[tuple[str, str, str | None]]:
         last_end = end
 
     return filtered
+
+
+# --- Admin-Only Mode Middleware ---
+class AdminOnlyMiddleware(BaseMiddleware):
+    """
+    Guards incoming messages when admin-only mode is active.
+    - Administrators always pass through unconditionally.
+    - In private chats, non-admins receive a maintenance notice if sending commands or media links.
+    - In group chats, non-admin messages are silently dropped to avoid spam.
+    """
+
+    async def __call__(
+        self,
+        handler: Callable[[TelegramObject, dict[str, Any]], Awaitable[Any]],
+        event: TelegramObject,
+        data: dict[str, Any],
+    ) -> Any:
+        if not isinstance(event, Message):
+            return await handler(event, data)
+
+        global admin_only_mode
+        if not admin_only_mode:
+            return await handler(event, data)
+
+        user_id = event.from_user.id if event.from_user else None
+        if is_admin(user_id):
+            return await handler(event, data)
+
+        # User is not an admin and admin_only_mode is active
+        if event.chat.type == "private":
+            text = event.text or event.caption or ""
+            is_cmd = text.startswith("/")
+            has_media = bool(extract_media_links(text)) if text else False
+            if is_cmd or has_media:
+                try:
+                    await event.reply(
+                        "🛠️ <b>Maintenance Mode / Технічні роботи</b>\n\n"
+                        "The bot is temporarily available only to administrators. Please try again later!\n"
+                        "<i>Бот тимчасово доступний лише для адміністраторів. Будь ласка, спробуйте пізніше!</i>",
+                        parse_mode="HTML",
+                        allow_sending_without_reply=True,
+                    )
+                except TelegramAPIError:
+                    pass
+
+        # In group chats or non-actionable private messages: drop silently
+        return None
+
+
+dp.message.outer_middleware(AdminOnlyMiddleware())
 
 
 # Global shared HTTP session for connection pooling
@@ -854,7 +954,7 @@ async def handle_start(message: Message):
         "💡 <i>Just send any video link here or add me to your group chat!</i>\n"
         "<i>Просто надішліть посилання у цей чат або додайте мене до групи!</i>"
     )
-    await message.reply(welcome_text, parse_mode="HTML")
+    await message.reply(welcome_text, parse_mode="HTML", allow_sending_without_reply=True)
 
 
 @dp.message(Command("help"))
@@ -871,12 +971,133 @@ async def handle_help(message: Message):
         "• <b>Private chats:</b> In direct 1-on-1 chats, messages are never deleted.\n\n"
         "⚠️ <i>Telegram Bot API limits maximum upload size to 50 MB.</i>"
     )
-    await message.reply(help_text, parse_mode="HTML")
+    if is_admin(message.from_user.id if message.from_user else None):
+        help_text += (
+            "\n\n👑 <b>Admin Controls / Адміністрування:</b>\n"
+            "• <code>/adminonly [on|off|status]</code> (або <code>/maintenance</code>) — увімкнути/вимкнути режим тільки для адмінів."
+        )
+    await message.reply(help_text, parse_mode="HTML", allow_sending_without_reply=True)
 
 
 @dp.message(Command("ping"))
 async def handle_ping(message: Message):
-    await message.reply("🏓 <b>Pong!</b> Relay is online and ready.", parse_mode="HTML")
+    user_id = message.from_user.id if message.from_user else "unknown"
+    status_suffix = ""
+    if is_admin(message.from_user.id if message.from_user else None):
+        mode_str = "🔒 ON (Admin-only)" if admin_only_mode else "🔓 OFF (Public)"
+        status_suffix = f"\n👑 <b>Role:</b> Admin | <b>Mode:</b> {mode_str}"
+    await message.reply(
+        f"🏓 <b>Pong!</b> Relay is online and ready.\n"
+        f"👤 <b>Your ID:</b> <code>{user_id}</code>{status_suffix}",
+        parse_mode="HTML",
+        allow_sending_without_reply=True,
+    )
+
+
+@dp.message(Command("adminonly", "maintenance"))
+async def handle_admin_only(message: Message, command: CommandObject):
+    user_id = message.from_user.id if message.from_user else None
+
+    if not ADMIN_IDS:
+        if message.chat.type == "private":
+            await message.reply(
+                f"⚠️ <b>ADMIN_IDS не налаштовано в .env!</b>\n\n"
+                f"Ваш Telegram User ID: <code>{user_id or 'unknown'}</code>\n\n"
+                f"Щоб керувати ботом, додайте ваш ID у файл <code>.env</code>:\n"
+                f"<code>ADMIN_IDS={user_id or 12345678}</code>\n"
+                f"та перезапустіть бота на сервері.",
+                parse_mode="HTML",
+                allow_sending_without_reply=True,
+            )
+        return
+
+    if not is_admin(user_id):
+        if message.chat.type == "private":
+            await message.reply(
+                "⛔ <b>Access denied / Доступ заборонено</b>",
+                parse_mode="HTML",
+                allow_sending_without_reply=True,
+            )
+        return
+
+    global admin_only_mode
+    action = (command.args or "").strip().lower()
+
+    if action in ("on", "enable", "1", "true"):
+        admin_only_mode = True
+        save_admin_only_mode(True)
+        await message.reply(
+            "🔒 <b>Admin-Only Mode: ENABLED / УВІМКНЕНО</b>\n\n"
+            "The bot is now restricted. Regular users cannot use Relay.\n"
+            "Only bot administrators can download media and send commands.\n\n"
+            "<i>Бот переведено в режим обмеженого доступу. Роботу для звичайних користувачів призупинено.\n"
+            "Бот реагує виключно на команди та посилання від адміністраторів.</i>\n\n"
+            "💡 <i>Disable anytime with: <code>/adminonly off</code></i>",
+            parse_mode="HTML",
+            allow_sending_without_reply=True,
+        )
+    elif action in ("off", "disable", "0", "false"):
+        admin_only_mode = False
+        save_admin_only_mode(False)
+        await message.reply(
+            "🔓 <b>Admin-Only Mode: DISABLED / ВИМКНЕНО</b>\n\n"
+            "The bot is now available for all users and group chats.\n\n"
+            "<i>Режим обмеження вимкнено. Relay знову доступний для всіх користувачів та груп.</i>\n\n"
+            "💡 <i>Enable anytime with: <code>/adminonly on</code></i>",
+            parse_mode="HTML",
+            allow_sending_without_reply=True,
+        )
+    elif action == "status":
+        state_text = (
+            "🔒 <b>ENABLED (Тільки для адмінів)</b>"
+            if admin_only_mode
+            else "🔓 <b>DISABLED (Доступний усім)</b>"
+        )
+        admin_list = (
+            ", ".join(f"<code>{uid}</code>" for uid in sorted(ADMIN_IDS))
+            if ADMIN_IDS
+            else "<i>не налаштовано</i>"
+        )
+        await message.reply(
+            f"ℹ️ <b>Admin-Only Mode Status / Стан режиму:</b>\n\n"
+            f"• Режим: {state_text}\n"
+            f"• Адміністратори ({len(ADMIN_IDS)}): {admin_list}\n\n"
+            f"💡 <i>Використання: <code>/adminonly [on|off|status]</code> або просто <code>/adminonly</code> для перемикання.</i>",
+            parse_mode="HTML",
+            allow_sending_without_reply=True,
+        )
+    elif not action or action == "toggle":
+        admin_only_mode = not admin_only_mode
+        save_admin_only_mode(admin_only_mode)
+        if admin_only_mode:
+            await message.reply(
+                "🔒 <b>Admin-Only Mode: ENABLED / УВІМКНЕНО</b>\n\n"
+                "The bot is now restricted to administrators only.\n"
+                "<i>Бот переведено в режим «Тільки для адмінів».</i>\n\n"
+                "💡 <i>Use <code>/adminonly off</code> to reopen for all users.</i>",
+                parse_mode="HTML",
+                allow_sending_without_reply=True,
+            )
+        else:
+            await message.reply(
+                "🔓 <b>Admin-Only Mode: DISABLED / ВИМКНЕНО</b>\n\n"
+                "The bot is now available for all users.\n"
+                "<i>Бот доступний для всіх користувачів.</i>\n\n"
+                "💡 <i>Use <code>/adminonly on</code> to restrict to admins only.</i>",
+                parse_mode="HTML",
+                allow_sending_without_reply=True,
+            )
+    else:
+        await message.reply(
+            "⚠️ <b>Невідомий параметр!</b>\n\n"
+            "Використовуйте:\n"
+            "• <code>/adminonly on</code> — увімкнути режим тільки для адмінів\n"
+            "• <code>/adminonly off</code> — вимкнути (відкрити для всіх)\n"
+            "• <code>/adminonly status</code> — перевірити поточний стан\n"
+            "• <code>/adminonly</code> — перемкнути стан (toggle)",
+            parse_mode="HTML",
+            allow_sending_without_reply=True,
+        )
 
 
 # --- Fast Message Handler (Fast-path filtering & Batch Processing) ---
@@ -960,6 +1181,22 @@ async def main():
         format="%(asctime)s - %(name)s - %(levelname)s - %(message)s",
     )
     logging.getLogger("aiogram.event").setLevel(logging.WARNING)
+
+    if ADMIN_IDS:
+        logger.info(
+            "Завантажено %d адміністратор(ів) у список ADMIN_IDS: %s",
+            len(ADMIN_IDS),
+            list(ADMIN_IDS),
+        )
+    else:
+        logger.warning(
+            "ADMIN_IDS не налаштовано в .env. Адміністративні команди будуть недоступні."
+        )
+
+    if admin_only_mode:
+        logger.warning(
+            "УВАГА: Бот запущено в режимі 'Тільки для адмінів' (admin_only_mode=True)!"
+        )
 
     # Initialize HTTP connection pool
     http_session = aiohttp.ClientSession(

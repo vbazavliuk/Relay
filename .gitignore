@@ -8,6 +8,7 @@
 *.key
 *.cert
 cookies.txt
+settings.json
 
 # Allow tracking configuration examples only
 !.env.example
