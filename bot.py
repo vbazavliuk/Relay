@@ -6,6 +6,7 @@ import re
 import shutil
 import subprocess
 import tempfile
+import time
 from collections import OrderedDict
 from collections.abc import Awaitable, Callable
 from contextlib import asynccontextmanager
@@ -56,29 +57,24 @@ ADMIN_IDS: set[int] = {
 
 SETTINGS_FILE = os.getenv("SETTINGS_FILE", "settings.json")
 
+# Chat administrators cache: chat_id -> (timestamp, set_of_admin_user_ids)
+CHAT_ADMIN_CACHE_TTL = 300  # 5 minutes
+chat_admin_cache: dict[int, tuple[float, set[int]]] = {}
 
-def load_admin_only_mode() -> bool:
-    """Loads the persisted admin-only mode state from disk if available."""
+
+def load_settings() -> dict[str, Any]:
+    """Loads the persisted settings from disk if available."""
     if os.path.exists(SETTINGS_FILE):
         try:
             with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                return bool(data.get("admin_only_mode", False))
+                return json.load(f)
         except Exception as e:
             logger.warning("Не вдалося зчитати %s: %s", SETTINGS_FILE, e)
-    return False
+    return {}
 
 
-def save_admin_only_mode(enabled: bool) -> None:
-    """Persists admin-only mode state to disk."""
-    data = {}
-    if os.path.exists(SETTINGS_FILE):
-        try:
-            with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-        except Exception:
-            data = {}
-    data["admin_only_mode"] = enabled
+def save_settings(data: dict[str, Any]) -> None:
+    """Persists settings to disk."""
     try:
         with open(SETTINGS_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, indent=2)
@@ -86,12 +82,94 @@ def save_admin_only_mode(enabled: bool) -> None:
         logger.error("Не вдалося зберегти %s: %s", SETTINGS_FILE, e)
 
 
-admin_only_mode: bool = load_admin_only_mode()
+_initial_settings = load_settings()
+admin_only_mode: bool = bool(_initial_settings.get("admin_only_mode", False))
+admin_only_chats: set[int] = {
+    int(cid) for cid in _initial_settings.get("admin_only_chats", [])
+}
+
+
+def save_admin_only_mode(enabled: bool) -> None:
+    """Updates and persists global admin-only mode state."""
+    global admin_only_mode
+    admin_only_mode = enabled
+    data = load_settings()
+    data["admin_only_mode"] = enabled
+    data["admin_only_chats"] = sorted(list(admin_only_chats))
+    save_settings(data)
+
+
+def is_chat_admin_only(chat_id: int) -> bool:
+    """Checks if a group chat has admin-only mode enabled (/addon)."""
+    return chat_id in admin_only_chats
+
+
+def set_chat_admin_only(chat_id: int, enabled: bool) -> None:
+    """Enables (/addon) or disables (/addoff) admin-only mode for a specific chat."""
+    if enabled:
+        admin_only_chats.add(chat_id)
+    else:
+        admin_only_chats.discard(chat_id)
+    data = load_settings()
+    data["admin_only_mode"] = admin_only_mode
+    data["admin_only_chats"] = sorted(list(admin_only_chats))
+    save_settings(data)
 
 
 def is_admin(user_id: int | None) -> bool:
-    """Returns True if the user ID is in the configured ADMIN_IDS."""
+    """Returns True if the user ID is in the configured global ADMIN_IDS."""
     return bool(user_id and user_id in ADMIN_IDS)
+
+
+async def get_chat_admin_ids(chat_id: int, force_refresh: bool = False) -> set[int]:
+    """Retrieves and caches the set of administrator user IDs for a given chat."""
+    now = time.time()
+    if not force_refresh and chat_id in chat_admin_cache:
+        cached_ts, cached_ids = chat_admin_cache[chat_id]
+        if now - cached_ts < CHAT_ADMIN_CACHE_TTL:
+            return cached_ids
+
+    try:
+        admins = await bot.get_chat_administrators(chat_id=chat_id)
+        admin_ids = {m.user.id for m in admins if m.user}
+        chat_admin_cache[chat_id] = (now, admin_ids)
+        return admin_ids
+    except TelegramAPIError as e:
+        logger.warning("Не вдалося отримати адміністраторів чату %s: %s", chat_id, e)
+        if chat_id in chat_admin_cache:
+            return chat_admin_cache[chat_id][1]
+        return set()
+    except Exception as e:
+        logger.error(
+            "Несподівана помилка при отриманні адміністраторів чату %s: %s",
+            chat_id,
+            e,
+        )
+        return set()
+
+
+async def is_user_chat_admin(
+    chat_id: int,
+    user_id: int | None,
+    sender_chat_id: int | None = None,
+    force_refresh: bool = False,
+) -> bool:
+    """
+    Checks if a user is an administrator in the specified chat.
+    Considers:
+    1. Anonymous chat administrators (sender_chat == chat_id)
+    2. Global bot administrators (from ADMIN_IDS)
+    3. Chat administrators fetched from Telegram API (cached)
+    """
+    if sender_chat_id and sender_chat_id == chat_id:
+        return True
+    if user_id and is_admin(user_id):
+        return True
+    if not user_id:
+        return False
+    admin_ids = await get_chat_admin_ids(chat_id, force_refresh=force_refresh)
+    return user_id in admin_ids
+
 
 
 # Regular expressions for media links
@@ -968,13 +1046,17 @@ async def handle_help(message: Message):
         "<b>Group Chats / Для груп:</b>\n"
         "• <b>Privacy:</b> Turn off Group Privacy in @BotFather to let Relay read links automatically.\n"
         "• <b>Clean chat mode:</b> If Relay has admin rights to delete messages, it will automatically delete the message containing the link, leaving only the clean video in the chat!\n"
+        "• <b>Admin-only mode (/addon & /addoff):</b> Group admins can restrict Relay to process links exclusively from administrators.\n"
+        "  - <code>/addon</code> — allow video downloads ONLY for group admins\n"
+        "  - <code>/addoff</code> — open video downloads for ALL chat members\n"
+        "  - <code>/addstatus</code> — check current mode in this chat\n"
         "• <b>Private chats:</b> In direct 1-on-1 chats, messages are never deleted.\n\n"
         "⚠️ <i>Telegram Bot API limits maximum upload size to 50 MB.</i>"
     )
     if is_admin(message.from_user.id if message.from_user else None):
         help_text += (
-            "\n\n👑 <b>Admin Controls / Адміністрування:</b>\n"
-            "• <code>/adminonly [on|off|status]</code> (або <code>/maintenance</code>) — увімкнути/вимкнути режим тільки для адмінів."
+            "\n\n👑 <b>Global Admin Controls / Глобальне адміністрування:</b>\n"
+            "• <code>/adminonly [on|off|status]</code> (або <code>/maintenance</code>) — увімкнути/вимкнути глобальний режим обслуговування."
         )
     await message.reply(help_text, parse_mode="HTML", allow_sending_without_reply=True)
 
@@ -985,10 +1067,112 @@ async def handle_ping(message: Message):
     status_suffix = ""
     if is_admin(message.from_user.id if message.from_user else None):
         mode_str = "🔒 ON (Admin-only)" if admin_only_mode else "🔓 OFF (Public)"
-        status_suffix = f"\n👑 <b>Role:</b> Admin | <b>Mode:</b> {mode_str}"
+        status_suffix = f"\n👑 <b>Role:</b> Bot Admin | <b>Global Mode:</b> {mode_str}"
+    if message.chat.type in ("group", "supergroup"):
+        group_mode = (
+            "🔒 ON (/addon - only admins)"
+            if is_chat_admin_only(message.chat.id)
+            else "🔓 OFF (/addoff - all members)"
+        )
+        status_suffix += f"\n👥 <b>Group Mode:</b> {group_mode}"
     await message.reply(
         f"🏓 <b>Pong!</b> Relay is online and ready.\n"
         f"👤 <b>Your ID:</b> <code>{user_id}</code>{status_suffix}",
+        parse_mode="HTML",
+        allow_sending_without_reply=True,
+    )
+
+
+@dp.message(Command("addon"))
+async def handle_addon(message: Message):
+    if message.chat.type == "private":
+        await message.reply(
+            "ℹ️ Команда <code>/addon</code> призначена для групових чатів.\n"
+            "<i>Вона вмикає режим, за якого бот завантажує відео лише за посиланнями від адміністраторів групи.</i>",
+            parse_mode="HTML",
+            allow_sending_without_reply=True,
+        )
+        return
+
+    sender_chat_id = message.sender_chat.id if message.sender_chat else None
+    user_id = message.from_user.id if message.from_user else None
+
+    is_adm = await is_user_chat_admin(
+        message.chat.id, user_id, sender_chat_id, force_refresh=True
+    )
+    if not is_adm:
+        await message.reply(
+            "⛔ <b>Ця команда доступна лише адміністраторам цієї групи.</b>",
+            parse_mode="HTML",
+            allow_sending_without_reply=True,
+        )
+        return
+
+    set_chat_admin_only(message.chat.id, True)
+    await message.reply(
+        "🔒 <b>Режим «Тільки для адмінів» УВІМКНЕНО для цієї групи (/addon)!</b>\n\n"
+        "Тепер бот завантажуватиме медіа <b>лише за посиланнями від адміністраторів</b> цієї групи.\n"
+        "Посилання від інших учасників будуть ігноруватися.\n\n"
+        "💡 <i>Вимкнути та відкрити для всіх: <code>/addoff</code></i>",
+        parse_mode="HTML",
+        allow_sending_without_reply=True,
+    )
+
+
+@dp.message(Command("addoff"))
+async def handle_addoff(message: Message):
+    if message.chat.type == "private":
+        await message.reply(
+            "ℹ️ Команда <code>/addoff</code> призначена для групових чатів.",
+            parse_mode="HTML",
+            allow_sending_without_reply=True,
+        )
+        return
+
+    sender_chat_id = message.sender_chat.id if message.sender_chat else None
+    user_id = message.from_user.id if message.from_user else None
+
+    is_adm = await is_user_chat_admin(
+        message.chat.id, user_id, sender_chat_id, force_refresh=True
+    )
+    if not is_adm:
+        await message.reply(
+            "⛔ <b>Ця команда доступна лише адміністраторам цієї групи.</b>",
+            parse_mode="HTML",
+            allow_sending_without_reply=True,
+        )
+        return
+
+    set_chat_admin_only(message.chat.id, False)
+    await message.reply(
+        "🔓 <b>Режим «Тільки для адмінів» ВИМКНЕНО для цієї групи (/addoff)!</b>\n\n"
+        "Тепер бот завантажує медіа за посиланнями <b>від усіх учасників</b> цієї групи.\n\n"
+        "💡 <i>Увімкнути знову: <code>/addon</code></i>",
+        parse_mode="HTML",
+        allow_sending_without_reply=True,
+    )
+
+
+@dp.message(Command("addstatus"))
+async def handle_addstatus(message: Message):
+    if message.chat.type == "private":
+        await message.reply(
+            "ℹ️ Команда <code>/addstatus</code> призначена для групових чатів.",
+            parse_mode="HTML",
+            allow_sending_without_reply=True,
+        )
+        return
+
+    is_on = is_chat_admin_only(message.chat.id)
+    state_text = (
+        "🔒 <b>УВІМКНЕНО (/addon)</b> — бот завантажує відео лише за лінками від адмінів"
+        if is_on
+        else "🔓 <b>ВИМКНЕНО (/addoff)</b> — бот завантажує відео для всіх учасників"
+    )
+    await message.reply(
+        f"ℹ️ <b>Статус режиму в цій групі:</b>\n\n"
+        f"• Стан: {state_text}\n\n"
+        f"💡 <i>Керування: <code>/addon</code> (лише адміни) або <code>/addoff</code> (для всіх).</i>",
         parse_mode="HTML",
         allow_sending_without_reply=True,
     )
@@ -1133,6 +1317,18 @@ async def handle_message(message: Message):
     if not media_items:
         return
 
+    # Check per-group admin-only mode (/addon)
+    if message.chat.type in ("group", "supergroup") and is_chat_admin_only(message.chat.id):
+        sender_chat_id = message.sender_chat.id if message.sender_chat else None
+        user_id = message.from_user.id if message.from_user else None
+        if not await is_user_chat_admin(message.chat.id, user_id, sender_chat_id):
+            logger.debug(
+                "Ігноруємо посилання в чаті %s: увімкнено /addon, користувач %s не є адміном",
+                message.chat.id,
+                user_id,
+            )
+            return
+
     # Cap to avoid overload from a single message (process up to 5 links)
     media_items = media_items[:5]
 
@@ -1196,6 +1392,13 @@ async def main():
     if admin_only_mode:
         logger.warning(
             "УВАГА: Бот запущено в режимі 'Тільки для адмінів' (admin_only_mode=True)!"
+        )
+
+    if admin_only_chats:
+        logger.info(
+            "Завантажено %d груп з увімкненим режимом /addon: %s",
+            len(admin_only_chats),
+            list(admin_only_chats),
         )
 
     # Initialize HTTP connection pool

@@ -48,8 +48,8 @@
 * 📐 **Ідеальні пропорції (Aspect Ratio Retention)**: завдяки аналізу метаданих через `ffprobe` (облік SAR та тегів орієнтації камери `rotate` 90°/270°) ролики не стискаються до співвідношення 1:1 та не розтягуються.
 * 🔊 **100% гарантія звуку**: зведення роздільних потоків відео (H.264/AVC) та аудіо (AAC) у сумісний контейнер MP4 з прапорцем `+faststart` для моментального перегляду в режимі стримінгу.
 * ⚡ **Блискавичний LRU-кеш**: раніше завантажені відео миттєво відправляються іншим користувачам за мілісекунди через Telegram `file_id` без повторного завантаження з інтернету.
-* 🛡 **Контроль навантаження**: асинхронний семафор (`asyncio.Semaphore`) обмежує кількість важких завантажень, захищаючи процесор і пам'ять VPS від перевантаження.
-* 👑 **Режим «Тільки для адмінів» (Admin-Only Mode)**: можливість вимкнути роботу бота для звичайних користувачів командою `/adminonly` або `/maintenance`. У цьому режимі бот обробляє запити виключно для адміністраторів зі списку `ADMIN_IDS`. У приватних повідомленнях користувачі отримують сповіщення про техобслуговування, а в групах повідомлення не-адмінів ігноруються без спаму.
+* 👥 **Керування в групах (/addon та /addoff)**: будь-який адміністратор конкретної групи може написати `/addon`, щоб бот завантажував відео **виключно за посиланнями від адміністраторів цієї групи**, ігноруючи посилання від звичайних учасників. Команда `/addoff` знову відкриває завантаження для всіх учасників. Бот динамічно зчитує адміністраторів через Telegram API без необхідності прописувати списки чатів вручну.
+* 👑 **Глобальний режим обслуговування (Global Admin-Only Mode)**: можливість вимкнути роботу бота для звичайних користувачів командою `/adminonly` або `/maintenance`. У цьому режимі бот обробляє запити виключно для глобальних адміністраторів зі списку `ADMIN_IDS`.
 
 ---
 
@@ -261,8 +261,8 @@ Specifically engineered to eliminate the infamous **Telegram square/squished vid
 * 📐 **Zero Aspect Ratio Distortion**: deep video inspection via `ffprobe` (accounting for Sample Aspect Ratio and smartphone `rotate` 90°/270° orientation tags) guarantees videos are never compressed into 1:1 boxes or stretched unnaturally.
 * 🔊 **100% Sound Guarantee**: automatic stream muxing of video (H.264/AVC) and audio (AAC) streams into MP4 containers with `-movflags +faststart` for immediate streaming in Telegram clients.
 * ⚡ **Ultra-Fast LRU Memory Cache**: previously downloaded videos are re-sent to any user within milliseconds using cached Telegram `file_id` references, saving bandwidth and VPS CPU.
-* 🛡 **Concurrency Throttling**: an asynchronous semaphore (`asyncio.Semaphore`) prevents server overloads by strictly capping simultaneous heavy downloads.
-* 👑 **Admin-Only Mode**: toggle bot access for regular users using `/adminonly` or `/maintenance`. When enabled, Relay exclusively services administrators defined by `ADMIN_IDS` in `.env`. In direct chats, regular users receive a polite maintenance alert, while group chat requests from non-admins are dropped silently without spam.
+* 👥 **Per-Group Admin-Only Mode (/addon & /addoff)**: any group chat administrator can send `/addon` to make Relay process video links **exclusively from administrators of that group**, ignoring links from regular members. The `/addoff` command restores public access for all members. Administrators are detected automatically via Telegram API without manual configuration.
+* 👑 **Global Maintenance Mode**: bot owners can globally restrict bot usage via `/adminonly` or `/maintenance` based on `ADMIN_IDS`.
 
 ---
 
