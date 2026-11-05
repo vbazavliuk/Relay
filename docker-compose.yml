@@ -7,12 +7,34 @@
 # ==============================================================================
 
 services:
+  telegram-bot-api:
+    image: aiogram/telegram-bot-api:latest
+    container_name: telegram-bot-api
+    restart: unless-stopped
+    environment:
+      TELEGRAM_API_ID: ${TELEGRAM_API_ID}
+      TELEGRAM_API_HASH: ${TELEGRAM_API_HASH}
+      TELEGRAM_STAT: "1"
+    volumes:
+      - telegram-bot-api-data:/var/lib/telegram-bot-api
+    command:
+      - --dir=/var/lib/telegram-bot-api
+      - --temp-dir=/tmp
+      - --http-port=8081
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
   relay:
     build:
       context: .
       dockerfile: Dockerfile
     container_name: relay-bot
     restart: unless-stopped
+    depends_on:
+      - telegram-bot-api
     env_file:
       - .env
     volumes:
@@ -22,3 +44,34 @@ services:
       options:
         max-size: "10m"
         max-file: "3"
+
+  # Background storage manager: ensures cache strictly never exceeds 10 GB
+  cleaner:
+    image: alpine:latest
+    container_name: relay-cleaner
+    restart: unless-stopped
+    volumes:
+      - telegram-bot-api-data:/var/lib/telegram-bot-api
+    command: >
+      sh -c '
+        while true; do
+          # 1. Clean media files older than 60 minutes
+          find /var/lib/telegram-bot-api -type f ! -name "*.sqlite*" ! -name "*.bin" -mmin +60 -delete 2>/dev/null || true
+
+          # 2. Hard limit: if total cache directory exceeds 10 GB (10485760 KB), purge oldest media files
+          DIR_SIZE=$$(du -sk /var/lib/telegram-bot-api 2>/dev/null | cut -f1)
+          if [ -n "$$DIR_SIZE" ] && [ "$$DIR_SIZE" -gt 10485760 ]; then
+            echo "[Cleaner] Storage exceeded 10 GB ($$DIR_SIZE KB). Purging oldest media files..."
+            find /var/lib/telegram-bot-api -type f ! -name "*.sqlite*" ! -name "*.bin" -exec ls -t {} + 2>/dev/null | tail -n +50 | xargs -r rm -f 2>/dev/null || true
+          fi
+          sleep 600
+        done
+      '
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "5m"
+        max-file: "2"
+
+volumes:
+  telegram-bot-api-data:

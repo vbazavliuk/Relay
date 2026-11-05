@@ -16,6 +16,8 @@ from typing import Any
 import aiohttp
 import yt_dlp
 from aiogram import BaseMiddleware, Bot, Dispatcher
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiogram.client.telegram import TelegramAPIServer
 from aiogram.enums import ChatAction
 from aiogram.exceptions import TelegramAPIError
 from aiogram.filters import Command, CommandObject, CommandStart
@@ -44,7 +46,20 @@ BOT_TOKEN = os.getenv("BOT_TOKEN")
 if not BOT_TOKEN:
     raise ValueError("Токен Telegram не знайдено! Перевірте файл .env")
 
-bot = Bot(token=BOT_TOKEN)
+# Local Telegram Bot API Server (supports uploading files up to 2000 MB)
+TELEGRAM_API_SERVER = os.getenv("TELEGRAM_API_SERVER")
+if TELEGRAM_API_SERVER:
+    logger.info("Використовується локальний Telegram Bot API Server: %s", TELEGRAM_API_SERVER)
+    bot = Bot(
+        token=BOT_TOKEN,
+        session=AiohttpSession(
+            api=TelegramAPIServer.from_base(TELEGRAM_API_SERVER),
+            timeout=300.0,
+        ),
+    )
+else:
+    bot = Bot(token=BOT_TOKEN)
+
 dp = Dispatcher()
 
 # Administrator configuration and maintenance mode
@@ -286,6 +301,38 @@ download_semaphore = asyncio.Semaphore(MAX_CONCURRENT_DOWNLOADS)
 
 COOKIES_FILE = os.getenv("COOKIES_FILE", "cookies.txt")
 
+# Video limits: 15 minutes duration, 400 MB direct file size, 650 MB max with auto-compression
+MAX_VIDEO_DURATION_SECONDS = int(os.getenv("MAX_VIDEO_DURATION_SECONDS", "900"))
+MAX_FILE_SIZE_BYTES = int(os.getenv("MAX_FILE_SIZE_MB", "400")) * 1024 * 1024
+MAX_COMPRESS_SIZE_BYTES = int(os.getenv("MAX_COMPRESS_SIZE_MB", "650")) * 1024 * 1024
+
+
+# --- Media Processing Exceptions ---
+class MediaError(Exception):
+    """Base exception for media processing errors with a user-facing explanation."""
+
+    def __init__(self, user_message: str):
+        super().__init__(user_message)
+        self.user_message = user_message
+
+
+class VideoTooLongError(MediaError):
+    """Raised when a video exceeds the maximum duration limit (15 minutes)."""
+
+    pass
+
+
+class VideoTooLargeError(MediaError):
+    """Raised when a video exceeds the maximum file size limit (200 MB)."""
+
+    pass
+
+
+class RestrictedContentError(MediaError):
+    """Raised when a video is age-restricted, private, or requires authentication."""
+
+    pass
+
 
 # --- Cached Video Data ---
 @dataclass
@@ -495,6 +542,61 @@ def generate_thumbnail(
         return False
 
 
+def compress_video_to_target_size(
+    input_path: str,
+    output_path: str,
+    duration: int,
+    target_size_mb: int = 380,
+) -> bool:
+    """
+    Compresses video to fit strictly under target_size_mb using ffmpeg single-pass with target bitrate.
+    """
+    try:
+        target_total_bits = target_size_mb * 1024 * 1024 * 8
+        total_bitrate = int(target_total_bits / max(duration, 1))
+
+        # Audio bitrate: 96 kbps
+        audio_bitrate_kb = 96
+        audio_bitrate = audio_bitrate_kb * 1000
+
+        # Video bitrate: total - audio (floor at 250 kbps)
+        video_bitrate = max(total_bitrate - audio_bitrate, 250_000)
+
+        cmd = [
+            "ffmpeg",
+            "-y",
+            "-i",
+            input_path,
+            "-c:v",
+            "libx264",
+            "-b:v",
+            str(video_bitrate),
+            "-maxrate",
+            str(int(video_bitrate * 1.2)),
+            "-bufsize",
+            str(int(video_bitrate * 2)),
+            "-preset",
+            "veryfast",
+            "-c:a",
+            "aac",
+            "-b:a",
+            f"{audio_bitrate_kb}k",
+            "-movflags",
+            "+faststart",
+            output_path,
+        ]
+        res = subprocess.run(cmd, capture_output=True, timeout=240)
+        return (
+            res.returncode == 0
+            and os.path.exists(output_path)
+            and os.path.getsize(output_path) > 0
+            and os.path.getsize(output_path) <= target_size_mb * 1024 * 1024 * 1.05
+        )
+    except Exception as e:
+        logger.warning("Помилка стиснення відео через ffmpeg (%s): %s", input_path, e)
+        return False
+
+
 async def reply_with_video_file(
     message: Message,
     original_url: str,
@@ -508,23 +610,85 @@ async def reply_with_video_file(
     if not os.path.exists(file_path):
         return False
 
-    file_size = os.path.getsize(file_path)
-    if file_size > 50 * 1024 * 1024:
-        logger.warning("Файл перевищує ліміт Telegram (50 MB): %d байт", file_size)
+    # Extract video metadata first
+    meta = await asyncio.to_thread(probe_video_metadata, file_path)
+    width = meta.get("width")
+    height = meta.get("height")
+    duration = meta.get("duration")
+
+    if not width or not height:
+        logger.warning("Файл не містить відеопотоку (%s): %s", original_url, file_path)
+        return False
+
+    if duration and duration > MAX_VIDEO_DURATION_SECONDS:
+        mins = int(duration // 60)
+        secs = int(duration % 60)
+        limit_mins = MAX_VIDEO_DURATION_SECONDS // 60
+        logger.warning(
+            "Відео перевищує ліміт тривалості (%d хв): %d хв %d сек",
+            limit_mins,
+            mins,
+            secs,
+        )
         try:
             await message.reply(
-                "⚠️ Розмір відео перевищує 50 МБ (ліміт Telegram для ботів).",
+                f"⚠️ Відео занадто довге ({mins} хв {secs} с). "
+                f"Максимальна дозволена тривалість — {limit_mins} хвилин.",
                 allow_sending_without_reply=True,
             )
         except TelegramAPIError:
             pass
         return False
 
-    # Extract video metadata
-    meta = await asyncio.to_thread(probe_video_metadata, file_path)
-    width = meta.get("width")
-    height = meta.get("height")
-    duration = meta.get("duration")
+    file_size = os.path.getsize(file_path)
+    compressed_path: str | None = None
+
+    # If file exceeds 400 MB, try fast compression if under 650 MB and duration is known
+    if file_size > MAX_FILE_SIZE_BYTES:
+        mb = file_size / (1024 * 1024)
+        limit_mb = MAX_FILE_SIZE_BYTES // (1024 * 1024)
+        if (
+            file_size <= MAX_COMPRESS_SIZE_BYTES
+            and duration
+            and duration <= MAX_VIDEO_DURATION_SECONDS
+        ):
+            logger.info(
+                "Відео (%.1f МБ) перевищує ліміт %d МБ. Запуск оптимізаційного стиснення...",
+                mb,
+                limit_mb,
+            )
+            compressed_path = f"{file_path}_compressed.mp4"
+            compressed = await asyncio.to_thread(
+                compress_video_to_target_size,
+                file_path,
+                compressed_path,
+                duration,
+                380,
+            )
+            if compressed and os.path.exists(compressed_path):
+                file_path = compressed_path
+                file_size = os.path.getsize(file_path)
+                logger.info(
+                    "Відео успішно оптимізовано: %.1f МБ", file_size / (1024 * 1024)
+                )
+            else:
+                logger.warning("Стиснення не вдалося, перевірка ліміту розміру...")
+
+        if file_size > MAX_FILE_SIZE_BYTES:
+            logger.warning("Файл перевищує ліміт (%d MB): %.1f MB", limit_mb, mb)
+            try:
+                await message.reply(
+                    f"⚠️ Розмір відео ({mb:.1f} МБ) перевищує ліміт {limit_mb} МБ. Завантаження скасовано.",
+                    allow_sending_without_reply=True,
+                )
+            except TelegramAPIError:
+                pass
+            if compressed_path and os.path.exists(compressed_path):
+                try:
+                    os.remove(compressed_path)
+                except OSError:
+                    pass
+            return False
 
     # Generate thumbnail to guarantee proper aspect ratio in preview
     thumb_path = f"{file_path}_thumb.jpg"
@@ -566,6 +730,11 @@ async def reply_with_video_file(
                 os.remove(thumb_path)
             except OSError:
                 pass
+        if compressed_path and os.path.exists(compressed_path):
+            try:
+                os.remove(compressed_path)
+            except OSError:
+                pass
 
     return False
 
@@ -587,8 +756,112 @@ async def send_cached_video(message: Message, cached: CachedVideo) -> bool:
         return False
 
 
-# --- TikTok Downloader (TikWM API with fallback to yt-dlp) ---
-async def extract_tiktok_url(url: str) -> str | None:
+# --- TikTok Downloader (TikWM API with Slideshow Builder & fallback to yt-dlp) ---
+def probe_image_dimensions(image_path: str) -> tuple[int, int]:
+    """Returns (width, height) of an image using ffprobe, fallback to (1080, 1920)."""
+    try:
+        cmd = [
+            "ffprobe",
+            "-v",
+            "error",
+            "-show_entries",
+            "stream=width,height",
+            "-of",
+            "csv=s=x:p=0",
+            image_path,
+        ]
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=5)
+        if res.returncode == 0 and res.stdout.strip():
+            parts = res.stdout.strip().split("\n")[0].split("x")
+            return int(parts[0]), int(parts[1])
+    except Exception:
+        pass
+    return 1080, 1920
+
+
+def create_tiktok_slideshow_sync(
+    image_paths: list[str],
+    audio_path: str | None,
+    output_path: str,
+) -> bool:
+    """
+    Combines a list of static images and an optional audio track into an MP4 slideshow
+    video with smooth scaling, black letterboxing, 25 fps, and audio fadeout.
+    """
+    if not image_paths:
+        return False
+
+    n = len(image_paths)
+    if n == 1:
+        slide_dur = 4.0
+    elif n <= 6:
+        slide_dur = 3.0
+    elif n <= 12:
+        slide_dur = 2.5
+    else:
+        slide_dur = 2.0
+
+    total_duration = n * slide_dur
+
+    w, h = probe_image_dimensions(image_paths[0])
+    if w > h:
+        canvas_w, canvas_h = 1920, 1080
+    else:
+        canvas_w, canvas_h = 1080, 1920
+
+    inputs = []
+    filters = []
+    for i, img in enumerate(image_paths):
+        inputs.extend(["-loop", "1", "-t", str(slide_dur), "-i", img])
+        filters.append(
+            f"[{i}:v]scale={canvas_w}:{canvas_h}:force_original_aspect_ratio=decrease,"
+            f"pad={canvas_w}:{canvas_h}:(ow-iw)/2:(oh-ih)/2:color=black,setsar=1,fps=25[v{i}]"
+        )
+
+    concat_inputs = "".join(f"[v{i}]" for i in range(n))
+    filters.append(f"{concat_inputs}concat=n={n}:v=1:a=0[vout]")
+
+    cmd = ["ffmpeg", "-y", *inputs]
+
+    has_audio_file = bool(audio_path and os.path.exists(audio_path) and os.path.getsize(audio_path) > 0)
+    if has_audio_file:
+        cmd.extend(["-stream_loop", "-1", "-i", audio_path])
+        fade_st = max(total_duration - 0.5, 0.0)
+        filters.append(f"[{n}:a]afade=t=out:st={fade_st:.2f}:d=0.5[aout]")
+        audio_map = "[aout]"
+    else:
+        cmd.extend(["-f", "lavfi", "-t", f"{total_duration:.2f}", "-i", "anullsrc=r=44100:cl=stereo"])
+        audio_map = f"{n}:a"
+
+    filter_str = ";".join(filters)
+    cmd.extend([
+        "-filter_complex", filter_str,
+        "-map", "[vout]",
+        "-map", audio_map,
+        "-c:v", "libx264",
+        "-preset", "veryfast",
+        "-crf", "23",
+        "-c:a", "aac",
+        "-b:a", "128k",
+        "-t", f"{total_duration:.2f}",
+        "-pix_fmt", "yuv420p",
+        "-movflags", "+faststart",
+        output_path,
+    ])
+
+    try:
+        res = subprocess.run(cmd, capture_output=True, text=True, timeout=180)
+        return (
+            res.returncode == 0
+            and os.path.exists(output_path)
+            and os.path.getsize(output_path) > 0
+        )
+    except Exception as e:
+        logger.error("Помилка створення слайдшоу TikTok через ffmpeg: %s", e)
+        return False
+
+
+async def extract_tiktok_data(url: str) -> dict | None:
     if not http_session:
         return None
 
@@ -602,7 +875,7 @@ async def extract_tiktok_url(url: str) -> str | None:
             if response.status == 200:
                 payload = await response.json()
                 if payload.get("code") == 0:
-                    return payload.get("data", {}).get("play")
+                    return payload.get("data")
     except (
         aiohttp.ClientError,
         asyncio.TimeoutError,
@@ -612,6 +885,13 @@ async def extract_tiktok_url(url: str) -> str | None:
     ) as e:
         logger.error("Помилка парсингу TikTok через TikWM: %s", e)
 
+    return None
+
+
+async def extract_tiktok_url(url: str) -> str | None:
+    data = await extract_tiktok_data(url)
+    if data:
+        return data.get("play")
     return None
 
 
@@ -626,76 +906,239 @@ async def process_and_send_tiktok(message: Message, url: str) -> bool:
         file_path = os.path.join(temp_dir, "tiktok.mp4")
         success = False
 
-        # 1. Try TikWM API for fast watermark-free download
-        direct_url = await extract_tiktok_url(url)
-        if direct_url and http_session:
-            try:
-                async with http_session.get(direct_url, timeout=25) as resp:
-                    if resp.status == 200:
-                        content = await resp.read()
-                        with open(file_path, "wb") as f:
-                            f.write(content)
-                        success = await reply_with_video_file(
-                            message, url, file_path
-                        )
-            except Exception as e:
-                logger.debug("Помилка скачування прямого відео TikTok: %s", e)
-
-        # 2. If TikWM fails, fall back to yt-dlp
-        if not success:
-            async with download_semaphore:
-                ytdlp_file = await asyncio.to_thread(
-                    download_ytdlp_sync, url, None, "TikTok"
-                )
-            if ytdlp_file:
-                try:
-                    success = await reply_with_video_file(message, url, ytdlp_file)
-                finally:
-                    try:
-                        if os.path.exists(ytdlp_file):
-                            os.remove(ytdlp_file)
-                        p_dir = os.path.dirname(ytdlp_file)
-                        if os.path.exists(p_dir):
-                            os.rmdir(p_dir)
-                    except OSError:
-                        pass
-
-        # Cleanup TikWM temporary directory
         try:
-            if os.path.exists(file_path):
-                os.remove(file_path)
-            if os.path.exists(temp_dir):
-                os.rmdir(temp_dir)
-        except OSError:
-            pass
+            # 1. Try TikWM API for watermark-free download
+            data = await extract_tiktok_data(url)
+            if data and http_session:
+                images = data.get("images")
+                # Check if this is a photomode / slideshow post
+                if images and isinstance(images, list) and len(images) > 0:
+                    logger.info("Виявлено фото-слайдшоу TikTok (%d фото): %s", len(images), url)
+
+                    async def fetch_image(img_url: str, idx: int) -> str | None:
+                        img_path = os.path.join(temp_dir, f"slide_{idx:03d}.jpg")
+                        try:
+                            dl_timeout = aiohttp.ClientTimeout(total=45, connect=10, sock_read=30)
+                            async with http_session.get(img_url, timeout=dl_timeout) as resp:
+                                if resp.status == 200:
+                                    with open(img_path, "wb") as f:
+                                        async for chunk in resp.content.iter_chunked(64 * 1024):
+                                            f.write(chunk)
+                                    return img_path
+                        except Exception as e:
+                            logger.debug("Помилка завантаження фото слайду TikTok #%d: %s", idx, e)
+                        return None
+
+                    tasks = [fetch_image(img_url, i) for i, img_url in enumerate(images)]
+                    results = await asyncio.gather(*tasks)
+                    valid_images = [p for p in results if p and os.path.exists(p) and os.path.getsize(p) > 0]
+
+                    audio_url = data.get("music") or data.get("play")
+                    audio_path = None
+                    if audio_url:
+                        candidate_audio = os.path.join(temp_dir, "audio.mp4")
+                        try:
+                            dl_timeout = aiohttp.ClientTimeout(total=60, connect=10, sock_read=30)
+                            async with http_session.get(audio_url, timeout=dl_timeout) as resp:
+                                if resp.status == 200:
+                                    with open(candidate_audio, "wb") as f:
+                                        async for chunk in resp.content.iter_chunked(64 * 1024):
+                                            f.write(chunk)
+                                    if os.path.exists(candidate_audio) and os.path.getsize(candidate_audio) > 0:
+                                        audio_path = candidate_audio
+                        except Exception as e:
+                            logger.debug("Помилка завантаження аудіо до слайдшоу TikTok: %s", e)
+
+                    if valid_images:
+                        slideshow_path = os.path.join(temp_dir, "tiktok_slideshow.mp4")
+                        async with download_semaphore:
+                            encoded = await asyncio.to_thread(
+                                create_tiktok_slideshow_sync,
+                                valid_images,
+                                audio_path,
+                                slideshow_path,
+                            )
+                        if encoded and os.path.exists(slideshow_path):
+                            success = await reply_with_video_file(
+                                message, url, slideshow_path
+                            )
+
+                # Regular video post
+                elif data.get("play"):
+                    direct_url = data.get("hdplay") or data.get("play")
+                    try:
+                        dl_timeout = aiohttp.ClientTimeout(total=180, connect=15, sock_read=60)
+                        async with http_session.get(direct_url, timeout=dl_timeout) as resp:
+                            if resp.status == 200:
+                                with open(file_path, "wb") as f:
+                                    async for chunk in resp.content.iter_chunked(128 * 1024):
+                                        f.write(chunk)
+                                success = await reply_with_video_file(
+                                    message, url, file_path
+                                )
+                    except Exception as e:
+                        logger.debug("Помилка скачування прямого відео TikTok: %s", e)
+
+            # 2. If TikWM fails, fall back to yt-dlp
+            if not success:
+                async with download_semaphore:
+                    ytdlp_file = await asyncio.to_thread(
+                        download_ytdlp_sync, url, None, "TikTok"
+                    )
+                if ytdlp_file:
+                    try:
+                        success = await reply_with_video_file(message, url, ytdlp_file)
+                    finally:
+                        try:
+                            if os.path.exists(ytdlp_file):
+                                os.remove(ytdlp_file)
+                            p_dir = os.path.dirname(ytdlp_file)
+                            if os.path.exists(p_dir):
+                                os.rmdir(p_dir)
+                        except OSError:
+                            pass
+        finally:
+            shutil.rmtree(temp_dir, ignore_errors=True)
 
         return success
 
 
 # --- Universal yt-dlp Downloader with Guaranteed Audio & Aspect Ratio ---
+def check_restricted_content_error(e: Exception, platform_name: str) -> None:
+    """Checks if a YoutubeDLError was caused by age restriction, login wall, or private content."""
+    err_msg = str(e)
+    err_msg_lower = err_msg.lower()
+
+    if (
+        "this content isn't available to everyone" in err_msg_lower
+        or "can't be seen by certain audiences" in err_msg_lower
+        or "sign in to confirm your age" in err_msg_lower
+        or "age-restricted" in err_msg_lower
+        or "age restricted" in err_msg_lower
+        or "inappropriate for some users" in err_msg_lower
+        or "restricted video" in err_msg_lower
+        or "gating_type_thrift" in err_msg_lower
+    ):
+        raise RestrictedContentError(
+            f"⚠️ Це відео має вікові обмеження (18+) або обмеження доступу в {platform_name}. "
+            "Бот не може завантажити його без авторизації."
+        )
+
+    if (
+        "login required" in err_msg_lower
+        or "redirected to the login page" in err_msg_lower
+        or "registered users who follow this account" in err_msg_lower
+        or "this video is private" in err_msg_lower
+        or "private video" in err_msg_lower
+    ):
+        raise RestrictedContentError(
+            f"⚠️ Це відео або акаунт є приватним у {platform_name}. "
+            "Бот не може завантажити його без авторизації."
+        )
+
+
+def probe_ytdlp_metadata(
+    url: str,
+    extractor_args: dict | None = None,
+    platform_name: str = "media",
+) -> dict | None:
+    """Pre-fetches video metadata without downloading to check duration and size."""
+    probe_opts = {
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "socket_timeout": 15,
+    }
+    if os.path.exists(COOKIES_FILE):
+        probe_opts["cookiefile"] = COOKIES_FILE
+    if extractor_args:
+        probe_opts["extractor_args"] = extractor_args
+
+    try:
+        with yt_dlp.YoutubeDL(probe_opts) as ydl:
+            return ydl.extract_info(url, download=False)
+    except (VideoTooLongError, VideoTooLargeError, RestrictedContentError):
+        raise
+    except YoutubeDLError as e:
+        check_restricted_content_error(e, platform_name)
+        logger.debug("Попереднє отримання метаданих через yt-dlp завершилося з винятком: %s", e)
+        return None
+    except Exception as e:
+        logger.debug("Попереднє отримання метаданих через yt-dlp завершилося з винятком: %s", e)
+        return None
+
+
 def download_ytdlp_sync(
     url: str,
     extractor_args: dict | None = None,
     platform_name: str = "media",
 ) -> str | None:
+    # 1. Quick pre-check: verify duration and approximate size before downloading
+    info = probe_ytdlp_metadata(url, extractor_args, platform_name)
+    if info:
+        dur = info.get("duration")
+        if dur and dur > MAX_VIDEO_DURATION_SECONDS:
+            mins = int(dur // 60)
+            secs = int(dur % 60)
+            limit_mins = MAX_VIDEO_DURATION_SECONDS // 60
+            logger.info(
+                "Відео %s (%s) занадто довге: %d хв %d сек (ліміт: %d хв)",
+                platform_name,
+                url,
+                mins,
+                secs,
+                limit_mins,
+            )
+            raise VideoTooLongError(
+                f"⚠️ Відео занадто довге ({mins} хв {secs} с). "
+                f"Максимальна дозволена тривалість — {limit_mins} хвилин."
+            )
+
+        filesize = info.get("filesize") or info.get("filesize_approx")
+        if filesize and filesize > MAX_COMPRESS_SIZE_BYTES:
+            mb = int(filesize / (1024 * 1024))
+            limit_mb = MAX_FILE_SIZE_BYTES // (1024 * 1024)
+            logger.info(
+                "Відео %s (%s) перевищує максимальний ліміт розміру: %d МБ (ліміт: %d МБ)",
+                platform_name,
+                url,
+                mb,
+                limit_mb,
+            )
+            raise VideoTooLargeError(
+                f"⚠️ Очікуваний розмір відео ({mb} МБ) перевищує ліміт {limit_mb} МБ. Завантаження скасовано."
+            )
+
     temp_dir = tempfile.mkdtemp()
     out_tmpl = os.path.join(temp_dir, "%(id)s.%(ext)s")
 
+    def match_filter_limits(info_dict, *, incomplete):
+        if info_dict.get("is_live"):
+            return "Live streams are not supported"
+        dur_val = info_dict.get("duration")
+        if dur_val and dur_val > MAX_VIDEO_DURATION_SECONDS:
+            return "Video duration exceeds limit"
+        return None
+
     # Format selector:
-    # 1. Prioritizes best video (up to 1080p, H.264/AVC) + best audio (AAC/M4A).
+    # 1. Prioritizes best 1080p under 400 MB, falls back to 720p if 1080p is too heavy.
     # 2. Merges streams into MP4 container via ffmpeg, ensuring audio presence in Shorts/Reels.
     # 3. Adds +faststart (moov atom at file start) for instant Telegram streaming.
     ydl_opts = {
         "format": (
-            "bestvideo[height<=1080][vcodec^=avc][ext=mp4]+bestaudio[acodec^=mp4a]/"
-            "bestvideo[height<=1080][ext=mp4]+bestaudio[ext=m4a]/"
-            "bestvideo[height<=1080]+bestaudio/"
-            "best[height<=1080][ext=mp4]/"
-            "best[height<=1080]/"
+            "bestvideo[height<=1080][filesize_approx<=?400M][vcodec^=avc][ext=mp4]+bestaudio[acodec^=mp4a]/"
+            "bestvideo[height<=1080][filesize_approx<=?400M][ext=mp4]+bestaudio[ext=m4a]/"
+            "bestvideo[height<=1080][filesize_approx<=?400M]+bestaudio/"
+            "bestvideo[height<=720][filesize_approx<=?400M]+bestaudio/"
+            "best[height<=1080][filesize_approx<=?400M][ext=mp4]/"
+            "best[height<=1080][filesize_approx<=?400M]/"
+            "best[filesize_approx<=?400M]/"
+            "bestvideo[height<=720]+bestaudio/"
+            "best[height<=720]/"
             "best"
         ),
         "merge_output_format": "mp4",
-        "match_filter": yt_dlp.utils.match_filter_func("!is_live"),
+        "match_filter": match_filter_limits,
         "postprocessor_args": {
             "merger": ["-movflags", "+faststart"],
             "videoconverter": ["-movflags", "+faststart"],
@@ -704,8 +1147,8 @@ def download_ytdlp_sync(
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
-        "max_filesize": 48 * 1024 * 1024,
-        "socket_timeout": 15,
+        "max_filesize": MAX_COMPRESS_SIZE_BYTES,
+        "socket_timeout": 20,
         "concurrent_fragment_downloads": 4,
     }
 
@@ -717,11 +1160,12 @@ def download_ytdlp_sync(
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(url, download=True)
-            if not info:
+            download_info = ydl.extract_info(url, download=True)
+            if not download_info:
+                shutil.rmtree(temp_dir, ignore_errors=True)
                 return None
 
-            expected_path = ydl.prepare_filename(info)
+            expected_path = ydl.prepare_filename(download_info)
             base, _ = os.path.splitext(expected_path)
             final_path = f"{base}.mp4"
 
@@ -735,15 +1179,40 @@ def download_ytdlp_sync(
                 full_p = os.path.join(temp_dir, f)
                 if os.path.isfile(full_p) and full_p.endswith(".mp4"):
                     return full_p
-    except (YoutubeDLError, OSError) as e:
+
+            shutil.rmtree(temp_dir, ignore_errors=True)
+            return None
+    except (VideoTooLongError, VideoTooLargeError, RestrictedContentError):
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise
+    except YoutubeDLError as e:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        err_msg = str(e)
+        if "Video duration exceeds limit" in err_msg:
+            raise VideoTooLongError(
+                f"⚠️ Відео довше {MAX_VIDEO_DURATION_SECONDS // 60} хвилин (ліміт бота). Завантаження скасовано."
+            )
+        if "File is larger than max-filesize" in err_msg or "max-filesize" in err_msg:
+            raise VideoTooLargeError(
+                f"⚠️ Розмір відео перевищує {MAX_FILE_SIZE_BYTES // (1024 * 1024)} МБ. Завантаження скасовано."
+            )
+        check_restricted_content_error(e, platform_name)
         logger.error(
             "Помилка yt-dlp при завантаженні %s (%s): %s",
             platform_name,
             url,
             e,
         )
-
-    return None
+        return None
+    except OSError as e:
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        logger.error(
+            "Помилка ОС при завантаженні %s (%s): %s",
+            platform_name,
+            url,
+            e,
+        )
+        return None
 
 
 # --- Instagram Downloader (via yt-dlp) ---
@@ -841,11 +1310,12 @@ async def process_and_send_twitter(message: Message, url: str, tweet_id: str) ->
 
         if direct_url and http_session:
             try:
-                async with http_session.get(direct_url, timeout=25) as resp:
+                dl_timeout = aiohttp.ClientTimeout(total=180, connect=15, sock_read=60)
+                async with http_session.get(direct_url, timeout=dl_timeout) as resp:
                     if resp.status == 200:
-                        content = await resp.read()
                         with open(file_path, "wb") as f:
-                            f.write(content)
+                            async for chunk in resp.content.iter_chunked(128 * 1024):
+                                f.write(chunk)
                         success = await reply_with_video_file(
                             message, url, file_path
                         )
@@ -1011,6 +1481,13 @@ async def process_media_item(
             return await process_and_send_youtube(message, url)
         elif platform == "facebook":
             return await process_and_send_facebook(message, url)
+    except MediaError as e:
+        logger.info("Скасовано обробку %s (%s): %s", platform, url, e.user_message)
+        try:
+            await message.reply(e.user_message, allow_sending_without_reply=True)
+        except TelegramAPIError:
+            pass
+        return False
     except Exception as e:
         logger.error("Несподівана помилка при обробці %s (%s): %s", platform, url, e)
     return False
@@ -1051,7 +1528,8 @@ async def handle_help(message: Message):
         "  - <code>/addoff</code> (або <code>/add off</code>) — open video downloads for ALL chat members\n"
         "  - <code>/addstatus</code> (або <code>/add status</code>) — check current mode in this chat\n"
         "• <b>Private chats:</b> In direct 1-on-1 chats, messages are never deleted.\n\n"
-        "⚠️ <i>Telegram Bot API limits maximum upload size to 50 MB.</i>"
+        f"⚠️ <i>Limits: Max duration {MAX_VIDEO_DURATION_SECONDS // 60} mins, "
+        f"file size up to {MAX_FILE_SIZE_BYTES // (1024 * 1024)} MB (auto-compressed up to {MAX_COMPRESS_SIZE_BYTES // (1024 * 1024)} MB).</i>"
     )
     if is_admin(message.from_user.id if message.from_user else None):
         help_text += (
@@ -1418,6 +1896,35 @@ async def handle_message(message: Message):
 
 
 
+async def periodic_temp_cleaner():
+    """Periodically purges orphaned temporary files in /tmp older than 30 minutes."""
+    while True:
+        try:
+            await asyncio.sleep(1800)  # Every 30 minutes
+            now = time.time()
+            temp_dir = tempfile.gettempdir()
+            for item in os.listdir(temp_dir):
+                item_path = os.path.join(temp_dir, item)
+                try:
+                    if os.path.isdir(item_path) and item.startswith("tmp"):
+                        if now - os.path.getmtime(item_path) > 1800:
+                            shutil.rmtree(item_path, ignore_errors=True)
+                    elif os.path.isfile(item_path) and (
+                        item.endswith(".mp4")
+                        or item.endswith(".jpg")
+                        or item.endswith(".part")
+                        or item.endswith(".ytdl")
+                    ):
+                        if now - os.path.getmtime(item_path) > 1800:
+                            os.remove(item_path)
+                except OSError:
+                    pass
+        except asyncio.CancelledError:
+            break
+        except Exception as e:
+            logger.debug("Помилка фонового очищення temp: %s", e)
+
+
 async def main():
     global http_session
     logging.basicConfig(
@@ -1455,6 +1962,8 @@ async def main():
         connector=aiohttp.TCPConnector(limit=50, keepalive_timeout=60),
     )
 
+    cleaner_task = asyncio.create_task(periodic_temp_cleaner())
+
     try:
         await dp.start_polling(
             bot,
@@ -1462,6 +1971,7 @@ async def main():
             polling_timeout=20,
         )
     finally:
+        cleaner_task.cancel()
         if http_session and not http_session.closed:
             await http_session.close()
 
