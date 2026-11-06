@@ -5,14 +5,13 @@ Synthesizes a realistic, human-like Git commit history with organic progression,
 human flaws, scratch file lifecycles, and tutor feedback integration.
 """
 
-import os
-import sys
 import argparse
-import subprocess
-import json
-import shutil
-from datetime import datetime, timedelta
+import os
 import random
+import subprocess
+import sys
+from datetime import datetime, timedelta
+
 
 def run_cmd(cmd, cwd=".", env=None, check=True):
     merged_env = os.environ.copy()
@@ -66,10 +65,7 @@ def generate_timestamp_cluster(start_dt, end_dt, count=25):
 
     timestamps = []
     current = start_dt
-    
-    # Calculate average gap
-    avg_gap = total_seconds / (count * 1.5)
-    
+
     while len(timestamps) < count and current < end_dt:
         # Check hour: preferred hours are 13:00-18:00 and 19:30-23:30
         hour = current.hour
@@ -78,9 +74,9 @@ def generate_timestamp_cluster(start_dt, end_dt, count=25):
             advance_hours = random.randint(3, 6)
             current += timedelta(hours=advance_hours)
             continue
-            
+
         timestamps.append(current)
-        
+
         # Decide next jump: either short (3-18 mins) or medium (30-80 mins) or session break (3-6 hours)
         roll = random.random()
         if roll < 0.45:
@@ -100,7 +96,7 @@ def generate_timestamp_cluster(start_dt, end_dt, count=25):
         if next_dt >= end_dt:
             next_dt = end_dt - timedelta(minutes=random.randint(5, 20) * (count - len(timestamps)))
         timestamps.append(next_dt)
-        
+
     timestamps.sort()
     return timestamps[:count]
 
@@ -115,14 +111,14 @@ def main():
     parser.add_argument("--plan-json", help="Optional path to a custom commit plan JSON file")
     parser.add_argument("--tutor-feedback", help="Feedback message or note from tutor/reviewer to inject")
     parser.add_argument("--dry-run", action="store_true", help="Print planned commit timeline without modifying git")
-    
+
     args = parser.parse_args()
     repo_dir = os.path.abspath(args.repo_path)
-    
+
     if not os.path.exists(os.path.join(repo_dir, ".git")):
         print(f"[ERROR] Directory is not a git repository: {repo_dir}", file=sys.stderr)
         sys.exit(1)
-        
+
     # Detect author info
     author_name = args.author_name
     author_email = args.author_email
@@ -131,10 +127,10 @@ def main():
         author_name = detected_name or "Student Author"
     if not author_email:
         author_email = detected_email or "student@uni-frankfurt.de"
-        
+
     start_dt = datetime.strptime(args.start_date, "%Y-%m-%d %H:%M:%S")
     end_dt = datetime.strptime(args.end_date, "%Y-%m-%d %H:%M:%S")
-    
+
     print("==================================================")
     print("      GIT HISTORY SYNTHESIZER PRE-FLIGHT          ")
     print("==================================================")
@@ -145,7 +141,7 @@ def main():
     if args.tutor_feedback:
         print(f"Tutor Feedback: {args.tutor_feedback}")
     print("==================================================")
-    
+
     if args.dry_run:
         print("\n[DRY-RUN] Generating sample timeline:")
         sample_times = generate_timestamp_cluster(start_dt, end_dt, count=25)
@@ -160,9 +156,9 @@ def main():
     print(f"\n[1/4] Creating safety backup branch: {backup_branch}")
     run_cmd(f"git branch {backup_branch}", cwd=repo_dir)
 
-    print(f"[2/4] Initializing orphan synthesis branch...")
-    run_cmd(f"git checkout --orphan synthetic-history", cwd=repo_dir)
-    
+    print("[2/4] Initializing orphan synthesis branch...")
+    run_cmd("git checkout --orphan synthetic-history", cwd=repo_dir)
+
     print("[3/4] Ready to execute synthesis sequence.")
     print("      Provide a domain-specific plan or JSON sequence to apply commits.")
 

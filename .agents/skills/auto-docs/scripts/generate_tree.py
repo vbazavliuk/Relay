@@ -5,7 +5,6 @@ Outputs an ASCII or Markdown tree while skipping VCS, virtual environments,
 caches, and build artifacts.
 """
 
-import os
 import sys
 from pathlib import Path
 

@@ -26,6 +26,15 @@ Issues = "https://github.com/vbazavliuk/Relay/issues"
 [tool.ruff]
 line-length = 100
 target-version = "py311"
+exclude = [
+    ".git",
+    ".agents",
+    "__pycache__",
+    "build",
+    "dist",
+    ".venv",
+    "venv",
+]
 
 [tool.ruff.lint]
 select = ["E", "F", "W", "I"]
