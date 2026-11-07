@@ -8,7 +8,7 @@
 
 services:
   telegram-bot-api:
-    image: aiogram/telegram-bot-api:latest
+    image: aiogram/telegram-bot-api:10.3@sha256:ffb6caba7fa957d59ea04f8556ac302dd7821a6a3cebcc0c70a274520565f9aa
     container_name: telegram-bot-api
     restart: unless-stopped
     environment:
@@ -47,7 +47,7 @@ services:
 
   # Background storage manager: ensures cache strictly never exceeds 10 GB
   cleaner:
-    image: alpine:latest
+    image: alpine:3.24.4@sha256:93b41ef40b1677fce8fcc64ff4af09daddfacf5040afde618bc46c1e2d1cc7d4
     container_name: relay-cleaner
     restart: unless-stopped
     volumes:
