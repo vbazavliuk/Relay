@@ -1,4 +1,4 @@
-FROM python:3.12-slim-bookworm@sha256:935c3c5b12357a7e10caa9e1c6ca5692344d97cf229832ef584be2cec9fc03df
+FROM python:3.12-slim
 
 # Prevent Python from buffering stdout/stderr and writing .pyc files
 ENV PYTHONUNBUFFERED=1 \
@@ -20,7 +20,7 @@ RUN groupadd -r appuser && useradd -r -g appuser -u 1000 -d /app appuser \
 
 # Install Python dependencies
 COPY requirements.txt .
-RUN pip install --require-hashes -r requirements.txt
+RUN pip install -r requirements.txt
 
 # Copy application source code
 COPY --chown=appuser:appuser . .
